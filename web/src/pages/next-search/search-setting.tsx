@@ -10,6 +10,7 @@ import {
   MetadataFilter,
   MetadataFilterSchema,
 } from '@/components/metadata-filter';
+import { ModelTreeSelect } from '@/components/model-tree-select';
 import { SimilaritySliderFormField } from '@/components/similarity-slider';
 import { Button } from '@/components/ui/button';
 import { SingleFormSlider } from '@/components/ui/dual-range-slider';
@@ -23,14 +24,9 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { MultiSelect } from '@/components/ui/multi-select';
-import { RAGFlowSelect } from '@/components/ui/select';
 import { Spin } from '@/components/ui/spin';
 import { Switch } from '@/components/ui/switch';
 import { useFetchKnowledgeMetadataKeys } from '@/hooks/use-knowledge-request';
-import {
-  useComposeLlmOptionsByModelTypes,
-  useSelectLlmOptionsByModelType,
-} from '@/hooks/use-llm-request';
 import { useFetchTenantInfo } from '@/hooks/use-user-setting-request';
 import { cn } from '@/lib/utils';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -39,7 +35,6 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { z } from 'zod';
-import { LlmModelType } from '../dataset/dataset/constant';
 import {
   ISearchAppDetailProps,
   IUpdateSearchProps,
@@ -132,9 +127,7 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
       search_config: {
         kb_ids: search_config?.kb_ids || [],
         vector_similarity_weight:
-          (search_config?.vector_similarity_weight
-            ? 1 - search_config?.vector_similarity_weight
-            : 0.3) || 0.3,
+          search_config?.vector_similarity_weight ?? 0.3,
         web_search: search_config?.web_search || false,
         doc_ids: [],
         similarity_threshold: search_config?.similarity_threshold || 0.2,
@@ -190,16 +183,6 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
     }
   }, [open]);
 
-  const allOptions = useSelectLlmOptionsByModelType();
-  const rerankModelOptions = useMemo(() => {
-    return allOptions[LlmModelType.Rerank];
-  }, [allOptions]);
-
-  const aiSummeryModelOptions = useComposeLlmOptionsByModelTypes([
-    LlmModelType.Chat,
-    LlmModelType.Image2text,
-  ]);
-
   const rerankModelDisabled = useWatch({
     control: formMethods.control,
     name: 'search_config.use_rerank',
@@ -217,9 +200,8 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
     control: formMethods.control,
     name: 'search_config.reference_metadata.include',
   });
-  const { data: metadataKeys } = useFetchKnowledgeMetadataKeys(
-    selectedKbIds || [],
-  );
+  const { data: metadataKeys, loading: metadataKeysLoading } =
+    useFetchKnowledgeMetadataKeys(selectedKbIds || []);
   const metadataFieldOptions = useMemo(() => {
     return (metadataKeys || []).map((key) => ({
       label: key,
@@ -252,7 +234,13 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
         undefined,
       );
     }
-  }, [selectedKbIds, metadataKeys, referenceMetadataEnabled, formMethods]);
+  }, [
+    selectedKbIds,
+    metadataKeys,
+    metadataKeysLoading,
+    referenceMetadataEnabled,
+    formMethods,
+  ]);
 
   // Reset top_k to 1024 only when user actively disables rerank (from true to false)
   const prevRerankEnabled = useRef<boolean | undefined>(undefined);
@@ -304,7 +292,7 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
           ...other_config,
           reference_metadata: normalizedReferenceMetadata,
           chat_id: llm_setting.llm_id,
-          vector_similarity_weight: 1 - vector_similarity_weight,
+          vector_similarity_weight,
           rerank_id: use_rerank ? rerank_id : '',
           llm_setting: { ...llmSetting },
         },
@@ -341,15 +329,9 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
       >
         <Form {...formMethods}>
           <form
-            onSubmit={formMethods.handleSubmit(
-              (data) => {
-                console.log('Form submitted with data:', data);
-                onSubmit(data as unknown as IUpdateSearchProps);
-              },
-              (errors) => {
-                console.log('Validation errors:', errors);
-              },
-            )}
+            onSubmit={formMethods.handleSubmit((data) => {
+              onSubmit(data as unknown as IUpdateSearchProps);
+            })}
             className="space-y-6"
           >
             <AvatarNameDescription avatarField="avatar" />
@@ -417,7 +399,7 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
             <SimilaritySliderFormField
               isTooltipShown
               similarityName="search_config.similarity_threshold"
-              vectorSimilarityWeightName="search_config.vector_similarity_weight"
+              similarityWeightName="search_config.vector_similarity_weight"
               numberInputClassName="rounded-sm"
             ></SimilaritySliderFormField>
             {/* Rerank Model */}
@@ -449,11 +431,9 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
                         {t('chat.model')}
                       </FormLabel>
                       <FormControl>
-                        <RAGFlowSelect
+                        <ModelTreeSelect
+                          modelTypes={['rerank']}
                           {...field}
-                          options={rerankModelOptions}
-                          triggerClassName={'bg-bg-input'}
-                          // disabled={disabled}
                           placeholder={t('chat.model')}
                         />
                       </FormControl>
@@ -521,7 +501,6 @@ const SearchSetting: React.FC<SearchSettingProps> = ({
               // ></LlmSettingFieldItems>
               <LlmSettingFieldItems
                 prefix="search_config.llm_setting"
-                options={aiSummeryModelOptions}
                 showFields={[
                   'temperature',
                   'top_p',

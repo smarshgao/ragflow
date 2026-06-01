@@ -86,15 +86,25 @@ func (dao *DocumentDAO) List(offset, limit int) ([]*entity.Document, int64, erro
 }
 
 // ListByKBID list documents by knowledge base ID
-func (dao *DocumentDAO) ListByKBID(kbID string, offset, limit int) ([]*entity.Document, int64, error) {
-	var documents []*entity.Document
+func (dao *DocumentDAO) ListByKBID(kbID string, offset, limit int) ([]*entity.DocumentListItem, int64, error) {
+	var documents []*entity.DocumentListItem
 	var total int64
 
 	if err := DB.Model(&entity.Document{}).Where("kb_id = ?", kbID).Count(&total).Error; err != nil {
 		return nil, 0, err
 	}
 
-	err := DB.Where("kb_id = ?", kbID).Offset(offset).Limit(limit).Find(&documents).Error
+	err := DB.Table("document").
+		Select(`document.*, user_canvas.title as pipeline_name, user.nickname`).
+		Joins("JOIN file2document ON file2document.document_id = document.id").
+		Joins("JOIN file ON file.id = file2document.file_id").
+		Joins("LEFT JOIN user_canvas ON document.pipeline_id = user_canvas.id").
+		Joins("LEFT JOIN user ON document.created_by = user.id").
+		Where("document.kb_id = ?", kbID).
+		Order("document.create_time DESC").
+		Offset(offset).
+		Limit(limit).
+		Scan(&documents).Error
 	return documents, total, err
 }
 
@@ -147,4 +157,46 @@ func (dao *DocumentDAO) SumSizeByDatasetID(datasetID string) (int64, error) {
 		Where("kb_id = ?", datasetID).
 		Scan(&total).Error
 	return total, err
+}
+
+// GetParsingStatusByKBID aggregates document parsing status counts for a
+// dataset, mirroring DocumentService.get_parsing_status_by_kb_ids in Python.
+func (dao *DocumentDAO) GetParsingStatusByKBID(kbID string) (map[string]int64, error) {
+	result := map[string]int64{
+		"unstart_count": 0,
+		"running_count": 0,
+		"cancel_count":  0,
+		"done_count":    0,
+		"fail_count":    0,
+	}
+
+	var rows []struct {
+		Run *string `gorm:"column:run"`
+		Cnt int64   `gorm:"column:cnt"`
+	}
+	err := DB.Model(&entity.Document{}).
+		Select("run, COUNT(id) as cnt").
+		Where("kb_id = ?", kbID).
+		Group("run").
+		Scan(&rows).Error
+	if err != nil {
+		return nil, err
+	}
+
+	statusFieldMap := map[string]string{
+		string(entity.TaskStatusUnstart): "unstart_count",
+		string(entity.TaskStatusRunning): "running_count",
+		string(entity.TaskStatusCancel):  "cancel_count",
+		string(entity.TaskStatusDone):    "done_count",
+		string(entity.TaskStatusFail):    "fail_count",
+	}
+	for _, row := range rows {
+		if row.Run == nil {
+			continue
+		}
+		if field, ok := statusFieldMap[*row.Run]; ok {
+			result[field] = row.Cnt
+		}
+	}
+	return result, nil
 }

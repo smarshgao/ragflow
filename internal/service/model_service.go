@@ -25,7 +25,6 @@ import (
 	"ragflow/internal/entity"
 	modelModule "ragflow/internal/entity/models"
 	"strings"
-	"time"
 )
 
 // parseModelName parses a composite model name in format "model@instance@provider" or "model@provider"
@@ -43,6 +42,30 @@ func parseModelName(compositeName string) (modelName, instanceName, providerName
 	} else {
 		return "", "", "", fmt.Errorf("invalid model name format: %s", compositeName)
 	}
+}
+
+func newModelDriverForBaseURL(driver modelModule.ModelDriver, providerName, region, baseURL string) (modelModule.ModelDriver, error) {
+	if driver == nil {
+		return nil, fmt.Errorf("provider %s driver not found", providerName)
+	}
+
+	if strings.TrimSpace(baseURL) == "" {
+		return driver, nil
+	}
+
+	baseURLByRegion := map[string]string{
+		region: baseURL,
+	}
+	if region == "" {
+		baseURLByRegion["default"] = baseURL
+	}
+
+	newDriver := driver.NewInstance(baseURLByRegion)
+	if newDriver == nil {
+		return nil, fmt.Errorf("provider %s does not support custom base_url", providerName)
+	}
+
+	return newDriver, nil
 }
 
 func NewModelProviderService() *ModelProviderService {
@@ -88,17 +111,11 @@ func (m *ModelProviderService) AddModelProvider(providerName, userID string) (co
 		return common.CodeServerError, errors.New("fail to get UUID")
 	}
 
-	now := time.Now().Unix()
-	nowDate := time.Now().Truncate(time.Second)
 	tenantModelProvider := &entity.TenantModelProvider{
 		ID:           providerID,
 		ProviderName: providerName,
 		TenantID:     tenantID,
 	}
-	tenantModelProvider.CreateTime = &now
-	tenantModelProvider.UpdateTime = &now
-	tenantModelProvider.CreateDate = &nowDate
-	tenantModelProvider.UpdateDate = &nowDate
 	err = m.modelProviderDAO.Create(tenantModelProvider)
 	if err != nil {
 		return common.CodeServerError, fmt.Errorf("fail to create model provider: %s", err.Error())
@@ -203,11 +220,10 @@ func (m *ModelProviderService) ListSupportedModels(providerName, instanceName, u
 
 	// For local deployed models
 	if baseURL, ok := extra["base_url"]; ok && baseURL != "" {
-		newURL := map[string]string{
-			region: baseURL,
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return nil, err
 		}
-
-		driver = driver.NewInstance(newURL)
 	}
 
 	return driver.ListModels(apiConfig)
@@ -247,20 +263,14 @@ func (m *ModelProviderService) CreateProviderInstance(providerName, instanceName
 	}
 	extraStr := string(extraByte)
 
-	now := time.Now().Unix()
-	nowDate := time.Now().Truncate(time.Second)
 	tenantModelProvider := &entity.TenantModelInstance{
 		ID:           instanceID,
 		InstanceName: instanceName,
 		ProviderID:   provider.ID,
 		APIKey:       apiKey,
-		Status:       "enable",
+		Status:       "active",
 		Extra:        extraStr,
 	}
-	tenantModelProvider.CreateTime = &now
-	tenantModelProvider.UpdateTime = &now
-	tenantModelProvider.CreateDate = &nowDate
-	tenantModelProvider.UpdateDate = &nowDate
 	err = m.modelInstanceDAO.Create(tenantModelProvider)
 
 	if err != nil {
@@ -460,10 +470,10 @@ func (m *ModelProviderService) CheckProviderConnection(providerName, instanceNam
 
 	driver := providerInfo.ModelDriver
 	if baseURL, ok := extra["base_url"]; ok && baseURL != "" {
-		newURL := map[string]string{
-			region: baseURL,
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return common.CodeServerError, err
 		}
-		driver = driver.NewInstance(newURL)
 	}
 
 	err = driver.CheckConnection(apiConfig)
@@ -471,6 +481,128 @@ func (m *ModelProviderService) CheckProviderConnection(providerName, instanceNam
 		return common.CodeServerError, err
 	}
 	return common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ListTasks(providerName, instanceName, userID string) ([]modelModule.ListTaskStatus, common.ErrorCode, error) {
+
+	// Get tenant ID from user
+	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	if len(tenants) == 0 {
+		return nil, common.CodeNotFound, errors.New("user has no tenants")
+	}
+
+	tenantID := tenants[0].TenantID
+
+	// Check if provider exists
+	provider, err := m.modelProviderDAO.GetByTenantIDAndProviderName(tenantID, providerName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	instance, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(provider.ID, instanceName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		return nil, common.CodeServerError, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	var extra map[string]string
+	err = json.Unmarshal([]byte(instance.Extra), &extra)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	apiConfig := &modelModule.APIConfig{
+		ApiKey: nil,
+		Region: nil,
+	}
+
+	region := extra["region"]
+	apiConfig.Region = &region
+	apiConfig.ApiKey = &instance.APIKey
+
+	driver := providerInfo.ModelDriver
+	if baseURL, ok := extra["base_url"]; ok && baseURL != "" {
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+	}
+
+	var listTaskResponse []modelModule.ListTaskStatus
+	listTaskResponse, err = driver.ListTasks(apiConfig)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	return listTaskResponse, common.CodeSuccess, nil
+}
+
+func (m *ModelProviderService) ShowTask(providerName, instanceName, taskID, userID string) (*modelModule.TaskResponse, common.ErrorCode, error) {
+
+	// Get tenant ID from user
+	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	if len(tenants) == 0 {
+		return nil, common.CodeNotFound, errors.New("user has no tenants")
+	}
+
+	tenantID := tenants[0].TenantID
+
+	// Check if provider exists
+	provider, err := m.modelProviderDAO.GetByTenantIDAndProviderName(tenantID, providerName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	instance, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(provider.ID, instanceName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+	if providerInfo == nil {
+		return nil, common.CodeServerError, fmt.Errorf("provider %s not found", providerName)
+	}
+
+	var extra map[string]string
+	err = json.Unmarshal([]byte(instance.Extra), &extra)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	apiConfig := &modelModule.APIConfig{
+		ApiKey: nil,
+		Region: nil,
+	}
+
+	region := extra["region"]
+	apiConfig.Region = &region
+	apiConfig.ApiKey = &instance.APIKey
+
+	driver := providerInfo.ModelDriver
+	if baseURL, ok := extra["base_url"]; ok && baseURL != "" {
+		driver, err = newModelDriverForBaseURL(driver, providerName, region, baseURL)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+	}
+
+	var taskResponse *modelModule.TaskResponse
+	taskResponse, err = driver.ShowTask(taskID, apiConfig)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+	return taskResponse, common.CodeSuccess, nil
 }
 
 func (m *ModelProviderService) AlterProviderInstance(providerName, instanceName, newInstanceName, apiKey, userID string) (common.ErrorCode, error) {
@@ -788,10 +920,10 @@ func (m *ModelProviderService) ChatToModelWithMessages(providerName, instanceNam
 
 		modelConfig.ModelClass = &providerInfo.Class
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		var response *modelModule.ChatResponse
 		response, err = newProviderInfo.ChatWithMessages(modelName, messages, apiConfig, modelConfig)
@@ -890,10 +1022,10 @@ func (m *ModelProviderService) ChatToModelStreamWithSender(providerName, instanc
 
 		modelConfig.ModelClass = &providerInfo.Class
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		err = newProviderInfo.ChatStreamlyWithSender(modelName, messages, apiConfig, modelConfig, sender)
 		if err != nil {
@@ -996,10 +1128,10 @@ func (m *ModelProviderService) EmbedText(providerName, instanceName, modelName, 
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		var response []modelModule.EmbeddingData
 		response, err = newProviderInfo.Embed(&modelName, texts, apiConfig, modelConfig)
@@ -1104,10 +1236,10 @@ func (m *ModelProviderService) RerankDocument(providerName, instanceName, modelN
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		var response *modelModule.RerankResponse
 		response, err = newProviderInfo.Rerank(&modelName, query, documents, apiConfig, modelConfig)
@@ -1212,10 +1344,10 @@ func (m *ModelProviderService) TranscribeAudio(providerName, instanceName, model
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		var response *modelModule.ASRResponse
 		response, err = newProviderInfo.TranscribeAudio(&modelName, audioFile, apiConfig, asrConfig)
@@ -1311,10 +1443,10 @@ func (m *ModelProviderService) TranscribeAudioStream(providerName, instanceName,
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		err = newProviderInfo.TranscribeAudioWithSender(&modelName, audioFile, apiConfig, asrConfig, sender)
 		if err != nil {
@@ -1417,10 +1549,10 @@ func (m *ModelProviderService) AudioSpeech(providerName, instanceName, modelName
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		var response *modelModule.TTSResponse
 		response, err = newProviderInfo.AudioSpeech(&modelName, audioContent, apiConfig, ttsConfig)
@@ -1516,10 +1648,10 @@ func (m *ModelProviderService) AudioSpeechStream(providerName, instanceName, mod
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
 		err = newProviderInfo.AudioSpeechWithSender(&modelName, audioContent, apiConfig, ttsConfig, sender)
 		if err != nil {
@@ -1531,7 +1663,7 @@ func (m *ModelProviderService) AudioSpeechStream(providerName, instanceName, mod
 	return common.CodeServerError, errors.New("model is disabled")
 }
 
-func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, userID string, fileContent *string, apiConfig *modelModule.APIConfig, ocrConfig *modelModule.OCRConfig) (*modelModule.OCRResponse, common.ErrorCode, error) {
+func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, userID string, content []byte, url *string, apiConfig *modelModule.APIConfig, ocrConfig *modelModule.OCRConfig) (*modelModule.OCRFileResponse, common.ErrorCode, error) {
 	if apiConfig == nil {
 		apiConfig = &modelModule.APIConfig{}
 	}
@@ -1576,7 +1708,7 @@ func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, us
 		}
 
 		if !model.ModelTypeMap["ocr"] {
-			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s is not a TTS model", providerName, modelName))
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s is not an OCR model", providerName, modelName))
 		}
 
 		var extra map[string]string
@@ -1589,8 +1721,8 @@ func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, us
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		var response *modelModule.OCRResponse
-		response, err = providerInfo.ModelDriver.OCRFile(&modelName, fileContent, apiConfig, ocrConfig)
+		var response *modelModule.OCRFileResponse
+		response, err = providerInfo.ModelDriver.OCRFile(&modelName, content, url, apiConfig, ocrConfig)
 		if err != nil {
 			return nil, common.CodeServerError, err
 		}
@@ -1602,7 +1734,7 @@ func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, us
 	}
 
 	if modelInfo.Status == "active" {
-		if modelInfo.ModelType != "tts" {
+		if modelInfo.ModelType != "ocr" {
 			return nil, common.CodeServerError, errors.New(fmt.Sprintf("expect model %s@%s is an OCR model", modelName, providerName))
 		}
 		// For local deployed models
@@ -1621,13 +1753,123 @@ func (m *ModelProviderService) OCRFile(providerName, instanceName, modelName, us
 		apiConfig.Region = &region
 		apiConfig.ApiKey = &instance.APIKey
 
-		newURL := map[string]string{
-			region: extra["base_url"],
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
 		}
-		newProviderInfo := providerInfo.ModelDriver.NewInstance(newURL)
 
-		var response *modelModule.OCRResponse
-		response, err = newProviderInfo.OCRFile(&modelName, fileContent, apiConfig, ocrConfig)
+		var response *modelModule.OCRFileResponse
+		response, err = newProviderInfo.OCRFile(&modelName, content, url, apiConfig, ocrConfig)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+		if response == nil {
+			return nil, common.CodeServerError, errors.New("empty chat response")
+		}
+
+		return response, common.CodeSuccess, nil
+	}
+
+	return nil, common.CodeServerError, errors.New("model is disabled")
+}
+
+func (m *ModelProviderService) ParseFile(providerName, instanceName, modelName, userID string, content []byte, url *string, apiConfig *modelModule.APIConfig, parseFileConfig *modelModule.ParseFileConfig) (*modelModule.ParseFileResponse, common.ErrorCode, error) {
+	if apiConfig == nil {
+		apiConfig = &modelModule.APIConfig{}
+	}
+	if parseFileConfig == nil {
+		parseFileConfig = &modelModule.ParseFileConfig{}
+	}
+
+	// Get tenant ID from user
+	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	if len(tenants) == 0 {
+		return nil, common.CodeNotFound, errors.New("user has no tenants")
+	}
+
+	tenantID := tenants[0].TenantID
+
+	// Check if provider exists
+	provider, err := m.modelProviderDAO.GetByTenantIDAndProviderName(tenantID, providerName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	instance, err := m.modelInstanceDAO.GetByProviderIDAndInstanceName(provider.ID, instanceName)
+	if err != nil {
+		return nil, common.CodeServerError, err
+	}
+
+	modelInfo, err := m.modelDAO.GetModelByProviderIDAndInstanceIDAndModelName(provider.ID, instance.ID, modelName)
+	if err != nil {
+		providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+		if providerInfo == nil {
+			return nil, common.CodeNotFound, errors.New("provider not found")
+		}
+
+		var model *entity.Model = nil
+		model, err = dao.GetModelProviderManager().GetModelByName(providerName, modelName)
+		if err != nil {
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s not found", providerName, modelName))
+		}
+
+		if !model.ModelTypeMap["doc_parse"] {
+			return nil, common.CodeNotFound, errors.New(fmt.Sprintf("provider %s model %s is not a Document Parse model", providerName, modelName))
+		}
+
+		var extra map[string]string
+		err = json.Unmarshal([]byte(instance.Extra), &extra)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+
+		region := extra["region"]
+		apiConfig.Region = &region
+		apiConfig.ApiKey = &instance.APIKey
+
+		var response *modelModule.ParseFileResponse
+		response, err = providerInfo.ModelDriver.ParseFile(&modelName, content, url, apiConfig, parseFileConfig)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+		if response == nil {
+			return nil, common.CodeServerError, errors.New("empty chat response")
+		}
+
+		return response, common.CodeSuccess, nil
+	}
+
+	if modelInfo.Status == "active" {
+		if modelInfo.ModelType != "doc_parse" {
+			return nil, common.CodeServerError, errors.New(fmt.Sprintf("expect model %s@%s is a Document Parse model", modelName, providerName))
+		}
+		// For local deployed models
+		providerInfo := dao.GetModelProviderManager().FindProvider(providerName)
+		if providerInfo == nil {
+			return nil, common.CodeNotFound, errors.New("provider not found")
+		}
+
+		var extra map[string]string
+		err = json.Unmarshal([]byte(instance.Extra), &extra)
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+
+		region := extra["region"]
+		apiConfig.Region = &region
+		apiConfig.ApiKey = &instance.APIKey
+
+		newProviderInfo, err := newModelDriverForBaseURL(providerInfo.ModelDriver, providerName, region, extra["base_url"])
+		if err != nil {
+			return nil, common.CodeServerError, err
+		}
+
+		var response *modelModule.ParseFileResponse
+		response, err = newProviderInfo.ParseFile(&modelName, content, url, apiConfig, parseFileConfig)
 		if err != nil {
 			return nil, common.CodeServerError, err
 		}
@@ -1678,6 +1920,13 @@ type AddCustomModelRequest struct {
 }
 
 func (m *ModelProviderService) AddCustomModel(request *AddCustomModelRequest, userID string) (common.ErrorCode, error) {
+	if request == nil {
+		return common.CodeBadRequest, errors.New("request is required")
+	}
+	if len(request.ModelTypes) == 0 {
+		return common.CodeBadRequest, errors.New("model type is required")
+	}
+
 	// Get tenant ID from user
 	tenants, err := m.userTenantDAO.GetByUserIDAndRole(userID, "owner")
 	if err != nil {

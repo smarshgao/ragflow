@@ -19,11 +19,6 @@ type NvidiaModel struct {
 	httpClient *http.Client
 }
 
-func (n NvidiaModel) ParseFile() {
-	//TODO implement me
-	panic("implement me")
-}
-
 // NewNvidiaModel creates a new Nvidia model instance
 func NewNvidiaModel(baseURL map[string]string, urlSuffix URLSuffix) *NvidiaModel {
 	return &NvidiaModel{
@@ -275,6 +270,7 @@ func (n *NvidiaModel) ChatStreamlyWithSender(modelName string, messages []Messag
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 
@@ -566,8 +562,8 @@ func (z *NvidiaModel) TranscribeAudioWithSender(modelName *string, file *string,
 	return fmt.Errorf("%s, no such method", z.Name())
 }
 
-// AudioSpeech convert audio to text
-func (n *NvidiaModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, asrConfig *TTSConfig) (*TTSResponse, error) {
+// AudioSpeech convert text to audio
+func (n *NvidiaModel) AudioSpeech(modelName *string, audioContent *string, apiConfig *APIConfig, ttsConfig *TTSConfig) (*TTSResponse, error) {
 	return nil, fmt.Errorf("%s, no such method", n.Name())
 }
 
@@ -576,8 +572,13 @@ func (z *NvidiaModel) AudioSpeechWithSender(modelName *string, audioContent *str
 }
 
 // OCRFile OCR file
-func (m *NvidiaModel) OCRFile(modelName *string, fileContent *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRResponse, error) {
+func (m *NvidiaModel) OCRFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, ocrConfig *OCRConfig) (*OCRFileResponse, error) {
 	return nil, fmt.Errorf("%s, no such method", m.Name())
+}
+
+// ParseFile parse file
+func (z *NvidiaModel) ParseFile(modelName *string, content []byte, url *string, apiConfig *APIConfig, parseFileConfig *ParseFileConfig) (*ParseFileResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", z.Name())
 }
 
 // ListModels calls /v1/models on the configured NVIDIA NIM base URL
@@ -661,4 +662,12 @@ func (n NvidiaModel) Balance(apiConfig *APIConfig) (map[string]interface{}, erro
 func (n NvidiaModel) CheckConnection(apiConfig *APIConfig) error {
 	_, err := n.ListModels(apiConfig)
 	return err
+}
+
+func (z *NvidiaModel) ListTasks(apiConfig *APIConfig) ([]ListTaskStatus, error) {
+	return nil, fmt.Errorf("%s, no such method", z.Name())
+}
+
+func (z *NvidiaModel) ShowTask(taskID string, apiConfig *APIConfig) (*TaskResponse, error) {
+	return nil, fmt.Errorf("%s, no such method", z.Name())
 }
